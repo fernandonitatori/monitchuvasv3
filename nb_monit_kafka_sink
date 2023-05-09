@@ -1,0 +1,62 @@
+%python
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+import json
+import os
+
+os.environ['PYSPARK_SUBMIT_ARGS'] = '--packages org.apache.spark:spark-streaming-kafka-0-10_2.12:3.3.1,org.apache.spark:spark-sql-kafka-0-10_2.12:3.3.1 pyspark-shell'
+
+spark = SparkSession \
+        .builder \
+        .appName("File Streaming Demo") \
+        .master("local[3]") \
+        .config("spark.streaming.stopGracefullyOnShutdown", "true") \
+        .config("org.apache.spark:spark-sql-kafka-0-10_2.13:3.3.1", "org.apache.spark:spark-sql-kafka-0-10_2.13:3.3.1") \
+        .getOrCreate()
+
+schema = StructType([
+        StructField("deviceid", StringType()),
+        StructField("chuva", IntegerType()),
+        StructField("distancia", IntegerType()),
+        StructField("volume", DoubleType()),
+        StructField("varaltura", IntegerType()),
+        StructField("timestamp", StringType())
+    ])
+
+kafka_df = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", "200.145.27.25:9092") \
+        .option("subscribe", "medicao_lora") \
+        .option("startingOffsets", "latest") \
+        .option("includeHeaders", "true") \
+        .load()
+
+value_df = kafka_df.select(from_json(col("value").cast("string"), schema).alias("value"))
+
+value_df.printSchema()
+
+explode_df = value_df.select(col("value.deviceid"), col("value.chuva"), col("value.distancia"), col("value.volume"), col("value.varaltura"), col("value.timestamp"))
+
+
+save_df = explode_df.select("deviceid", "timestamp", "volume", "varaltura") \
+                    .groupBy(window(col("timestamp"), "10 minutes"), col("deviceid")) \
+                    .agg(max("volume").alias("max_volume"), max("varaltura").alias("max_varaltura")) \
+                    
+
+save_df.printSchema()
+
+kafka_target_df = save_df.selectExpr("CAST(deviceid AS STRING) as key", "to_json(struct(*)) as value") \
+                         .writeStream \
+                         .queryName("notification") \
+                         .format("kafka") \
+                         .option("kafka.bootstrap.servers", "200.145.27.25:9092") \
+                         .option("topic", "medicao_notif") \
+                         .outputMode("update") \
+                         .option("checkpointLocation", "chk-point-dir/notify6") \
+                         .trigger(processingTime="10 minutes") \
+                         .start() \
+                         .awaitTermination()
+
+
